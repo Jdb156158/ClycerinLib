@@ -1684,23 +1684,23 @@ const shadowGeo = new THREE.PlaneGeometry(1, 1);
 const GRAVITY = 14;
 const MAX_SUBSTEP = 1 / 120;
 const PARTICLE_DEF = {
-  belly:     { r:.50, floor:.10, mass:1.45 },
-  chest:     { r:.48, floor:.06, mass:1.35 },
-  neck:      { r:.30, floor:.03, mass:.62 },
-  head:      { r:.41, floor:.045, mass:1.28 },
-  snout:     { r:.21, floor:.02, mass:.28 },
-  earL:      { r:.17, floor:.012, mass:.19 },
-  earR:      { r:.17, floor:.012, mass:.19 },
-  shoulderL: { r:.25, floor:.035, mass:.44 },
-  elbowL:    { r:.19, floor:.02, mass:.33 },
-  handL:     { r:.21, floor:.012, mass:.33 },
-  shoulderR: { r:.25, floor:.035, mass:.44 },
-  elbowR:    { r:.19, floor:.02, mass:.33 },
-  handR:     { r:.21, floor:.012, mass:.33 },
-  hipL:      { r:.27, floor:.035, mass:.48 },
-  footL:     { r:.24, floor:.012, mass:.48 },
-  hipR:      { r:.27, floor:.035, mass:.48 },
-  footR:     { r:.24, floor:.012, mass:.48 }
+  belly:     { r:.50, floor:.28, mass:1.45 },
+  chest:     { r:.48, floor:.24, mass:1.35 },
+  neck:      { r:.30, floor:.15, mass:.62 },
+  head:      { r:.41, floor:.28, mass:1.28 },
+  snout:     { r:.21, floor:.10, mass:.28 },
+  earL:      { r:.17, floor:.06, mass:.19 },
+  earR:      { r:.17, floor:.06, mass:.19 },
+  shoulderL: { r:.25, floor:.15, mass:.44 },
+  elbowL:    { r:.19, floor:.09, mass:.33 },
+  handL:     { r:.21, floor:.10, mass:.33 },
+  shoulderR: { r:.25, floor:.15, mass:.44 },
+  elbowR:    { r:.19, floor:.09, mass:.33 },
+  handR:     { r:.21, floor:.10, mass:.33 },
+  hipL:      { r:.27, floor:.15, mass:.48 },
+  footL:     { r:.24, floor:.10, mass:.48 },
+  hipR:      { r:.27, floor:.15, mass:.48 },
+  footR:     { r:.24, floor:.10, mass:.48 }
 };
 
 const EDGES = [
@@ -1893,6 +1893,8 @@ class GummyBear {
     this.squashV = 0;
     this.press = 0;
     this.pressTarget = 0;
+    this.visualLift = 0;
+    this.plump = .88;
     this.grounded = true;
     this.grab = null;
     this.grabTarget = new THREE.Vector3();
@@ -1941,14 +1943,44 @@ const _c = new THREE.Vector3();
 const _q = new THREE.Vector3();
 function polarRotation(A, out) {
   out.copy(A);
+  // Regularise near-planar covariance matrices (very common when a
+  // candy is squashed on the table) before the polar iteration.
+  const reg = (Math.abs(out.elements[0]) + Math.abs(out.elements[4]) + Math.abs(out.elements[8]) + 1e-5) * .035;
+  out.elements[0] += reg;
+  out.elements[4] += reg;
+  out.elements[8] += reg;
   // Polar decomposition via the classic Higham iteration. This gives
   // the nearest pure rotation without needing an SVD implementation.
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 10; i++) {
     shapeInv.copy(out).invert();
     shapeRT.copy(shapeInv).transpose();
     const e = out.elements, t = shapeRT.elements;
     for (let n = 0; n < 9; n++) e[n] = (e[n] + t[n]) * .5;
   }
+  // Guarantee a right-handed orthonormal frame even if the input was
+  // close to singular.
+  const e = out.elements;
+  let ax = e[0], ay = e[1], az = e[2];
+  let l = Math.hypot(ax, ay, az);
+  if (l < 1e-7) { out.identity(); return out; }
+  ax /= l; ay /= l; az /= l;
+  let bx = e[3], by = e[4], bz = e[5];
+  const d = ax * bx + ay * by + az * bz;
+  bx -= ax * d; by -= ay * d; bz -= az * d;
+  l = Math.hypot(bx, by, bz);
+  if (l < 1e-7) {
+    // pick any perpendicular direction
+    if (Math.abs(ax) < .9) { bx = -az; by = 0; bz = ax; }
+    else { bx = 0; by = az; bz = -ay; }
+    l = Math.hypot(bx, by, bz);
+  }
+  bx /= l; by /= l; bz /= l;
+  const cx = ay * bz - az * by;
+  const cy = az * bx - ax * bz;
+  const cz = ax * by - ay * bx;
+  e[0] = ax; e[1] = ay; e[2] = az;
+  e[3] = bx; e[4] = by; e[5] = bz;
+  e[6] = cx; e[7] = cy; e[8] = cz;
   return out;
 }
 function shapeMatch(bear, alpha) {
@@ -2075,6 +2107,7 @@ function solveBearCollisions(iterations) {
   }
 }
 
+
 function applyGrab(b) {
   if (!b.grab) return;
   const p = b.particles[b.grab.index];
@@ -2185,6 +2218,8 @@ function updateJelly(b, dt) {
    ═══════════════════════════════════════════════════════════════ */
 const positionScratch = new THREE.Vector3();
 const normalScratch = new THREE.Vector3();
+const rigidA = new THREE.Matrix3();
+const rigidR = new THREE.Matrix3();
 const boneNormalMatrix = new THREE.Matrix3();
 const squashMatrix = new THREE.Matrix3();
 const headAxes = {
@@ -2292,6 +2327,34 @@ function deformBear(b) {
   b.com.copy(_v2);
   b.bounce = Math.max(0, b.comLocal.y - b.restComLocal.y);
 
+  // Best-fit rigid placement of the rest shape, used as a volume anchor.
+  // Pure linear-blend skinning can pinch at twisted joints; a partial
+  // pull toward this rigid shape keeps the candy plump in the air and
+  // on the table without removing its local jiggle.
+  rigidA.set(0,0,0, 0,0,0, 0,0,0);
+  for (let i = 0; i < b.particles.length; i++) {
+    const p = b.currentLocal[i];
+    const r = b.localRest[i];
+    const px = p.x - b.comLocal.x, py = p.y - b.comLocal.y, pz = p.z - b.comLocal.z;
+    const rx = r.x - b.restComLocal.x, ry = r.y - b.restComLocal.y, rz = r.z - b.restComLocal.z;
+    const w = b.particles[i].mass;
+    rigidA.elements[0] += px * rx * w;
+    rigidA.elements[3] += px * ry * w;
+    rigidA.elements[6] += px * rz * w;
+    rigidA.elements[1] += py * rx * w;
+    rigidA.elements[4] += py * ry * w;
+    rigidA.elements[7] += py * rz * w;
+    rigidA.elements[2] += pz * rx * w;
+    rigidA.elements[5] += pz * ry * w;
+    rigidA.elements[8] += pz * rz * w;
+  }
+  polarRotation(rigidA, rigidR);
+  const plumpTarget = b.grab ? (b.grabPressTarget > .02 ? .38 : .32) : .88;
+  b.plump = damp(b.plump, plumpTarget, 10, 1 / 60);
+  const re = rigidR.elements;
+  const rc = b.restComLocal;
+  const cc = b.comLocal;
+
   const pHead = b.currentLocal[PART.head];
   const desiredPress = clamp(b.grabPressTarget || 0, 0, .55);
   b.press = damp(b.press, desiredPress, 15, 1 / 60);
@@ -2312,6 +2375,7 @@ function deformBear(b) {
   const rx = skin.rx, ry = skin.ry, rz = skin.rz;
   const vcount = base.length / 3;
   const bones = b.boneData;
+  let minVisualY = Infinity;
 
   for (let v = 0; v < vcount; v++) {
     const vx = base[v * 3], vy = base[v * 3 + 1], vz = base[v * 3 + 2];
@@ -2335,13 +2399,32 @@ function deformBear(b) {
       pz += weight * (az + oz);
     }
     // global press / jelly deformation
+    if (b.plump > 0.001) {
+      const rx = vx - rc.x, ry = vy - rc.y, rz = vz - rc.z;
+      const gx = cc.x + re[0] * rx + re[3] * ry + re[6] * rz;
+      const gy = cc.y + re[1] * rx + re[4] * ry + re[7] * rz;
+      const gz = cc.z + re[2] * rx + re[5] * ry + re[8] * rz;
+      px += (gx - px) * b.plump;
+      py += (gy - py) * b.plump;
+      pz += (gz - pz) * b.plump;
+    }
     const qx = cx + (px - cx) * sxz;
     const qy = pivotY + (py - pivotY) * sy;
     const qz = cz + (pz - cz) * sxz;
     pos[v * 3] = qx;
-    pos[v * 3 + 1] = Math.max(.004, qy);
+    pos[v * 3 + 1] = qy;
     pos[v * 3 + 2] = qz;
+    if (qy < minVisualY) minVisualY = qy;
   }
+
+  // Never slice the candy flat against the table. Rising the whole
+  // surface keeps its volume when it lands on its side or belly.
+  const lift = minVisualY < .004 ? .004 - minVisualY : 0;
+  if (lift > 0) {
+    for (let v = 0; v < vcount; v++) pos[v * 3 + 1] += lift;
+  }
+  b.visualLift = lift;
+
   geo.attributes.position.needsUpdate = true;
   if (b.grab || ((visualFrame + (b.normalPhase || 0)) & 1) === 0) {
     geo.computeVertexNormals();
@@ -2356,14 +2439,24 @@ function deformBear(b) {
   const headP = pHead;
   const headRest = REST.head;
   const facePoint = (anchor) => {
-    return _v1.copy(headP)
+    _v1.copy(headP)
       .addScaledVector(headAxes.x, (anchor.x - headRest[0]) * frame.sx)
       .addScaledVector(headAxes.y, (anchor.y - headRest[1]) * frame.sy)
       .addScaledVector(headAxes.z, anchor.z - headRest[2]);
+    if (b.plump > 0.001) {
+      const rx = anchor.x - rc.x, ry = anchor.y - rc.y, rz = anchor.z - rc.z;
+      _v2.set(
+        cc.x + re[0] * rx + re[3] * ry + re[6] * rz,
+        cc.y + re[1] * rx + re[4] * ry + re[7] * rz,
+        cc.z + re[2] * rx + re[5] * ry + re[8] * rz
+      );
+      _v1.lerp(_v2, b.plump);
+    }
+    return _v1;
   };
   const setFace = (mesh, pos, scale) => {
     applySquashToPoint(b, pos.x, pos.y, pos.z, positionScratch);
-    mesh.position.set(positionScratch.x, Math.max(.008, positionScratch.y), positionScratch.z);
+    mesh.position.set(positionScratch.x, Math.max(.008, positionScratch.y + (b.visualLift || 0)), positionScratch.z);
     _m4.makeBasis(headAxes.x, headAxes.y, headAxes.z);
     mesh.quaternion.setFromRotationMatrix(_m4);
     mesh.scale.copy(scale);
